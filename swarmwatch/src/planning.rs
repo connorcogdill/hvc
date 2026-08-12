@@ -81,6 +81,15 @@ pub struct PlanParams {
     /// Mean log-evidence per audited epoch, **measured from canary runs**.
     /// `None` falls back to the theoretical ceiling and flags the assumption.
     pub measured_log_evidence_per_epoch: Option<f64>,
+    /// Epochs the population detector spends estimating per-session profiles
+    /// before it emits any evidence at all
+    /// (`MonitorConfig::profile_warmup_epochs`).
+    ///
+    /// This is dead time inside the detection window, not a modelling detail:
+    /// the deadline arrives whether or not the monitor has finished calibrating.
+    /// Omitting it understates the required audit rate by exactly the fraction
+    /// of the window it consumes.
+    pub profile_warmup_epochs: usize,
 }
 
 impl Default for PlanParams {
@@ -93,6 +102,7 @@ impl Default for PlanParams {
             t_irreversible_ms: 600_000,
             expected_halt_latency_ms: 30_000,
             measured_log_evidence_per_epoch: None,
+            profile_warmup_epochs: 20,
         }
     }
 }
@@ -201,8 +211,39 @@ pub fn required_audit_rate(p: &PlanParams) -> PlanResult {
         };
     }
 
-    let epochs_available =
-        detection_window_ms as f64 / p.epoch_duration_ms.max(1) as f64;
+    let raw_epochs = detection_window_ms as f64 / p.epoch_duration_ms.max(1) as f64;
+    // Warm-up is spent inside the window, not before it.
+    let epochs_available = (raw_epochs - p.profile_warmup_epochs as f64).max(0.0);
+
+    if epochs_available <= 0.0 {
+        findings.push(format!(
+            "the profile warm-up ({} epochs) consumes the entire detection window \
+             ({raw_epochs:.0} epochs): L2 never emits evidence before the deadline. \
+             Shorten the warm-up, shorten the epoch, or rely on L0/L1 for this goal.",
+            p.profile_warmup_epochs
+        ));
+        return PlanResult {
+            required_audit_rate: f64::INFINITY,
+            feasible: false,
+            epochs_available: 0.0,
+            epochs_needed_at_full_audit: f64::INFINITY,
+            evidence_per_epoch: per_epoch,
+            evidence_ceiling: ceiling,
+            used_measured_evidence: used_measured,
+            kappa,
+            findings,
+        };
+    }
+
+    if p.profile_warmup_epochs as f64 > 0.25 * raw_epochs {
+        findings.push(format!(
+            "the profile warm-up ({} epochs) consumes {:.0}% of the detection window; \
+             it is detection latency and is already charged against the budget here",
+            p.profile_warmup_epochs,
+            100.0 * p.profile_warmup_epochs as f64 / raw_epochs
+        ));
+    }
+
     let needed = ville_threshold(p.alpha) / per_epoch;
     let rate = needed / epochs_available;
     let feasible = rate <= 1.0;
@@ -353,6 +394,7 @@ mod tests {
             t_irreversible_ms: 8_000,
             expected_halt_latency_ms: 1_000,
             measured_log_evidence_per_epoch: Some(0.05),
+            profile_warmup_epochs: 0,
             ..Default::default()
         };
         let r = required_audit_rate(&p);
@@ -361,6 +403,50 @@ mod tests {
         assert!(r.findings.iter().any(|f| f.contains("INFEASIBLE")));
         assert!(r.findings.iter().any(|f| f.contains("reference agents")));
         assert!(r.render().contains("INFEASIBLE"));
+    }
+
+    #[test]
+    fn a_warmup_that_swallows_the_window_is_named_as_the_binding_constraint() {
+        // Diagnosis matters: "add more controls" is useless advice when the
+        // detector never starts before the deadline.
+        let p = PlanParams {
+            epoch_duration_ms: 1_000,
+            t_irreversible_ms: 8_000,
+            expected_halt_latency_ms: 1_000,
+            profile_warmup_epochs: 20,
+            measured_log_evidence_per_epoch: Some(5.0),
+            ..Default::default()
+        };
+        let r = required_audit_rate(&p);
+        assert!(!r.feasible);
+        assert_eq!(r.epochs_available, 0.0);
+        assert!(r.findings[0].contains("warm-up"));
+        assert!(r.findings[0].contains("L0/L1"));
+    }
+
+    #[test]
+    fn warmup_is_charged_against_the_detection_window() {
+        let base = PlanParams {
+            epoch_duration_ms: 1_000,
+            t_irreversible_ms: 200_000,
+            expected_halt_latency_ms: 0,
+            measured_log_evidence_per_epoch: Some(0.2),
+            profile_warmup_epochs: 0,
+            ..Default::default()
+        };
+        let warmed = PlanParams {
+            profile_warmup_epochs: 100,
+            ..base.clone()
+        };
+        let a = required_audit_rate(&base);
+        let b = required_audit_rate(&warmed);
+        assert_eq!(a.epochs_available, 200.0);
+        assert_eq!(b.epochs_available, 100.0);
+        assert!(
+            (b.required_audit_rate / a.required_audit_rate - 2.0).abs() < 1e-9,
+            "halving the usable window must double the required audit rate"
+        );
+        assert!(b.findings.iter().any(|f| f.contains("warm-up")));
     }
 
     #[test]

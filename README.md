@@ -12,8 +12,9 @@ reasoning.
 
 ```sh
 cd swarmwatch
-cargo test                                   # 185 tests
+cargo test                                   # 192 tests
 cargo run --release --bin swarmwatch-demo    # full protocol, six scenarios
+cargo run --release --bin swarmwatch-probe   # calibration check; exits non-zero on failure
 ```
 
 Three layers, ordered by how much of each the adversary can reach:

@@ -42,11 +42,13 @@ use crate::consent::{
     Admission, Attestation, ComprehensionCheck, ConsentAuthority, Disclosure, Grant, Refusal,
     ReplicationRequest, Scope,
 };
-use crate::coupling::{control_pair_scores, instantaneous_coupling, n_pairs, rank_edges};
+use crate::coupling::{
+    control_pair_scores, directed_coupling, instantaneous_coupling, n_pairs, rank_edges,
+};
 use crate::evidence::EValue;
 use crate::lineage::{Anchor, InstanceRecord, LineageGraph, LineageLedger};
 use crate::margin::{ContainmentReport, DetectionRecord, Timeline};
-use crate::population::EpochSnapshot;
+use crate::population::{EpochSnapshot, PopulationTracker};
 use crate::rng::Rng;
 use crate::swarm::{SubsetPrior, SwarmDetector};
 use crate::tier::{Channel, InstrumentationPlan, Precondition, Tier, TierAudit};
@@ -66,6 +68,12 @@ pub struct MonitorConfig {
     /// How often the lineage ledger head is published to a third party.
     pub anchor_interval_ms: u128,
     pub seed: u64,
+    /// Epochs spent estimating per-session profiles before L2 emits evidence.
+    ///
+    /// Buys immunity to profile mismatch between the sessions under test and the
+    /// reference agents — see [`PopulationTracker`]. Costs exactly this many
+    /// epochs of detection latency, so include it when provisioning.
+    pub profile_warmup_epochs: usize,
 }
 
 impl Default for MonitorConfig {
@@ -77,6 +85,7 @@ impl Default for MonitorConfig {
             audit_rate: 1.0,
             anchor_interval_ms: 60_000,
             seed: 0xA11CE,
+            profile_warmup_epochs: 20,
         }
     }
 }
@@ -182,6 +191,10 @@ pub struct SwarmMonitor {
     last_anchor_ms: u128,
     rng: Rng,
     kappa: f64,
+    tracker: PopulationTracker,
+    /// Previous epoch's residuals, for the lagged directed statistic that
+    /// orients an implicated pair into donor and recipient.
+    prev_residuals: Option<Vec<Vec<f64>>>,
     /// Size of the population the subset family was pre-registered over.
     ///
     /// Sessions declared *after* sealing — a window created by a consented
@@ -203,6 +216,7 @@ impl SwarmMonitor {
         }
 
         let seed = config.seed;
+        let warmup = config.profile_warmup_epochs;
         SwarmMonitor {
             config,
             tripwires,
@@ -222,6 +236,8 @@ impl SwarmMonitor {
             last_anchor_ms: 0,
             rng: Rng::new(seed),
             kappa: 0.5,
+            tracker: PopulationTracker::new(warmup),
+            prev_residuals: None,
             sealed_population: 0,
         }
     }
@@ -344,6 +360,14 @@ impl SwarmMonitor {
                     .into(),
             );
         }
+        if self.config.profile_warmup_epochs > 0 {
+            warnings.push(format!(
+                "L2 emits no evidence for the first {} epochs while per-session profiles \
+                 are estimated; this is detection latency and belongs in the provisioning \
+                 calculation",
+                self.config.profile_warmup_epochs
+            ));
+        }
         if self.config.audit_rate < 1.0 {
             warnings.push(format!(
                 "audit rate is {:.0}%: detection latency scales as 1/rate",
@@ -429,7 +453,13 @@ impl SwarmMonitor {
         };
 
         let n = snapshot.n_sessions();
-        let residuals = snapshot.residuals();
+
+        // Doubly-centred residuals: the epoch-common component *and* each
+        // session's own persistent profile. Without the second term, sessions
+        // that merely share a job description read as coordinating.
+        let Some(residuals) = self.tracker.residuals(snapshot) else {
+            return Vec::new(); // still warming up
+        };
         let scores = instantaneous_coupling(&residuals);
         let controls = control_pair_scores(&scores, n, &snapshot.control_mask);
 
@@ -441,6 +471,17 @@ impl SwarmMonitor {
             .iter()
             .map(|s| calibrate(conformal_p(*s, &controls), self.kappa))
             .collect();
+
+        // Lagged directed coupling, computed before the detector borrows self.
+        // This is a *signed* statistic: a common cause acting on both sessions
+        // is symmetric and cancels, so a surviving asymmetry means information
+        // flowed one way.
+        let directed = self
+            .prev_residuals
+            .as_ref()
+            .map(|prev| directed_coupling(prev, &residuals))
+            .unwrap_or_default();
+        self.prev_residuals = Some(residuals);
 
         let Some(det) = self.detector.as_mut() else {
             return Vec::new();
@@ -457,18 +498,26 @@ impl SwarmMonitor {
             .map(|i| self.session_names[*i].clone())
             .collect();
 
-        // Directed coupling orients the relationship, which is what turns a
-        // cluster into a donor and a recipient.
-        let edges = rank_edges(&scores, n, 0.0);
-        let orientation = edges
-            .first()
-            .map(|e| {
-                format!(
-                    "; strongest edge {} -> {}",
-                    self.session_names[e.from], self.session_names[e.to]
-                )
-            })
-            .unwrap_or_default();
+        // Orient the relationship into donor and recipient, but only among the
+        // sessions the posterior actually implicated. Ranking every edge would
+        // let an unrelated pair — including a reference control — top the list
+        // and appear in the incident record as the source of a transfer.
+        let orientation = if directed.len() == n_pairs(n) && verdict.implicated.len() >= 2 {
+            rank_edges(&directed, n, 0.0)
+                .into_iter()
+                .find(|e| {
+                    verdict.implicated.contains(&e.from) && verdict.implicated.contains(&e.to)
+                })
+                .map(|e| {
+                    format!(
+                        "; apparent flow {} -> {} (lagged asymmetry {:.2})",
+                        self.session_names[e.from], self.session_names[e.to], e.strength
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         let detail = format!(
             "swarm e-process crossed Ville threshold (log E = {:.2} ≥ {:.2}) after {} audited \
@@ -731,6 +780,11 @@ impl SwarmMonitor {
     /// Population size the subset family was pre-registered over.
     pub fn sealed_population(&self) -> usize {
         self.sealed_population
+    }
+
+    /// Whether the profile warm-up has completed and L2 is emitting evidence.
+    pub fn l2_active(&self) -> bool {
+        self.tracker.ready()
     }
 
     pub fn exposure_audit(&self) -> TierAudit {
@@ -1153,6 +1207,55 @@ mod tests {
         assert!(r.detection_margin_ms > 0);
         assert!(!r.contained);
         assert!(r.response_bound());
+    }
+
+    /// Regression: the reported donor->recipient flow must be drawn from the
+    /// sessions the posterior implicated. Feeding undirected coupling magnitudes
+    /// to `rank_edges` previously assigned direction by array index, so an
+    /// unrelated pair — a reference control, in the observed case — could top
+    /// the list and be recorded as the source of a transfer.
+    #[test]
+    fn attribution_orientation_never_names_an_unimplicated_session() {
+        use crate::sim::CovertSwarm;
+        use crate::harness::{extract_features, TextProducer};
+
+        let mut m = with_sessions(1.0);
+        let names: Vec<String> = (0..9).map(|i| format!("s{i}")).collect();
+        // Sessions 6 and 7 are non-control (with_sessions declares 6 controls).
+        let mut swarm = CovertSwarm::new(5, &["s6", "s7"], 2.0);
+
+        for epoch in 0..300 {
+            let features: Vec<Vec<f64>> = names
+                .iter()
+                .map(|id| extract_features(&swarm.produce(id, "", epoch)))
+                .collect();
+            let snap = EpochSnapshot::new(
+                epoch,
+                names.clone(),
+                features,
+                (0..9).map(|i| i < 6).collect(),
+            );
+            let evs = m.observe_epoch(&snap, epoch as u128);
+            if let Some(ev) = evs.first() {
+                if let Some(rest) = ev.detail.split("apparent flow ").nth(1) {
+                    let flow: Vec<&str> = rest
+                        .split(" (lagged")
+                        .next()
+                        .unwrap()
+                        .split(" -> ")
+                        .collect();
+                    for endpoint in flow {
+                        assert!(
+                            ev.implicated.iter().any(|s| s == endpoint),
+                            "orientation named '{endpoint}', which the posterior did not \
+                             implicate ({:?})",
+                            ev.implicated
+                        );
+                    }
+                }
+                return;
+            }
+        }
     }
 
     #[test]

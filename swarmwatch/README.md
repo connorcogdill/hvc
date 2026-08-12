@@ -14,8 +14,9 @@ different answers:
    specific transfer in front of them.
 
 ```
-cargo test                                     # 185 tests
+cargo test                                     # 192 tests
 cargo run --release --bin swarmwatch-demo      # full protocol, six scenarios
+cargo run --release --bin swarmwatch-probe     # calibration check; exits non-zero on failure
 ```
 
 Zero dependencies, by design. This is monitoring infrastructure: every
@@ -165,6 +166,56 @@ makes the sequential product a genuine test supermartingale: a frozen calibratio
 set shared across epochs induces dependence that breaks Ville's inequality, while
 same-epoch calibration is conditionally valid by construction.
 
+**Self-referential standardisation.** Each session is z-scored against its own
+causal history and nothing else. This is not a detail — it is the fix for the
+worst bug found in this system, and the reasoning generalises.
+
+Conformal validity needs the sessions under test to be exchangeable with the
+calibration set. But reference agents run pre-registered benign tasks while test
+sessions do the actual evaluation, so their *profiles* differ by construction.
+Centre everyone on the control median and every test session's residual carries
+the same offset; their pairwise cosine similarity inflates; the detector reports
+coordination when the truth is "these all differ from the reference set in the
+same way." Measured at a one-sigma offset on a population with **no coordination
+at all**, that fired on **82% of runs** at a nominal α of 1e-3.
+
+The decisive statistic is **null drift** — mean nats accumulated per epoch with
+nothing coordinating. A valid detector drifts ≤ 0; anything positive fires with
+probability one given enough epochs, at any α, so a clean short run proves
+nothing. Three centring schemes, measured:
+
+| profile mismatch | centre on controls | centre on all-but-self | **self only** |
+|---|---|---|---|
+| 0σ | −0.34 | −0.56 | **−0.55** |
+| 1σ | −0.25 | −0.52 | **−0.55** |
+| 2σ | **+0.01** | −0.44 | **−0.55** |
+| 4σ | **+0.57** | **+0.04** | **−0.55** |
+
+Any centre computed *from* the controls is asymmetric: test sessions all share
+one identical centre while each control gets a different leave-one-out subset, so
+the centre's own sampling noise is shared exactly between test pairs and only
+partially between control pairs. Self-standardisation is invariant because no
+session participates in another's baseline.
+
+It looks like a power trade — control-centring detected at moderate coupling
+where self-standardisation did not — but it is not one. Control-centring already
+sits 0.21 nats/epoch closer to its threshold under the null, so part of that
+"sensitivity" is the estimator measuring its own noise; the tell is that its
+detection rate *rose from 52% to 100% when an irrelevant profile offset was
+added*, which no real signal explains. Where both are trustworthy the two are
+identical: median detection at epoch 33, 100% of runs.
+
+Population-wide shocks need no special handling either, which is why nothing is
+lost. A shared slowdown inflates every pair equally, and a conformal p-value is a
+*rank* of a test pair among control pairs — invariant to any monotone effect
+applied to all of them. What the control-centring was trying to remove, the rank
+test removes for free.
+
+The cost is a **warm-up**: the first ~20 epochs estimate per-session moments and
+emit nothing. That is dead time inside the detection window, so
+`planning::required_audit_rate` charges it against the budget rather than
+treating it as free.
+
 **A swarm-level alternative.** The alternative is "*some unknown subset*
 coordinates" — `2ⁿ` hypotheses. A pre-registered mixture pays the multiplicity
 cost **once, as a prior penalty** (~2–7 nats), rather than re-paying a Bonferroni
@@ -242,7 +293,7 @@ and instrumentation is fixable.
 | `tier` | controllability tiering; instrumentation plan and exposure audit |
 | `evidence` | e-values, e-processes, Ville threshold, the two combination rules |
 | `conformal` | epoch-wise conformal calibration against concurrent controls |
-| `population` | control population, robust centring, residuals |
+| `population` | control population, self-referential standardisation, residuals |
 | `coupling` | pairwise and directed coupling; donor/recipient orientation |
 | `swarm` | subset-mixture detector and attribution posterior |
 | `canary` | load-bearing canary tokens, transform-robust scanning |
@@ -271,6 +322,13 @@ The system is built to be driven in this order, and refuses to skip steps:
 Step 7 deserves the emphasis. The most likely failure mode of a containment
 monitoring program is not that a clever adversary defeated it. It is that it was
 silently non-functional and nobody checked.
+
+Step 6 deserves a sharpening. Measure **null drift**, not just the false-positive
+count — `swarmwatch-probe` does this and exits non-zero on failure. A detector
+with positive drift alarms on a healthy population eventually, at any α, and a
+short negative-control run will look spotless right up until it does. Re-run the
+probe whenever the feature set, the control population, or the standardisation
+changes.
 
 ## Where a real deployment differs from this prototype
 

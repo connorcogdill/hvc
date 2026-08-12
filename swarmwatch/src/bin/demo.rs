@@ -107,6 +107,7 @@ fn main() {
         t_irreversible_ms: 300_000,
         expected_halt_latency_ms: 15_000,
         measured_log_evidence_per_epoch: Some(0.22), // from canary runs, not assumed
+        profile_warmup_epochs: 20, // dead time inside the window, charged here
         ..Default::default()
     };
     let plan = required_audit_rate(&params);
@@ -120,6 +121,9 @@ fn main() {
         N_CONTROL,
         calibration_points_for_pairwise(N_CONTROL)
     );
+    println!("\n  Null drift is the check that matters before any of this is trusted:");
+    println!("  run `cargo run --release --bin swarmwatch-probe`. A clean negative control");
+    println!("  can hide a detector that alarms on a healthy population given enough epochs.");
 
     // ---- 1. readiness ----------------------------------------------------
     rule("1. READINESS — seal the configuration and publish the commitment");

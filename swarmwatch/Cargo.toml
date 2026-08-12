@@ -24,3 +24,7 @@ path = "src/bin/demo.rs"
 
 [profile.release]
 opt-level = 3
+
+[[bin]]
+name = "swarmwatch-probe"
+path = "src/bin/probe.rs"
