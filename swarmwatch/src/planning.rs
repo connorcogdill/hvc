@@ -90,6 +90,19 @@ pub struct PlanParams {
     /// Omitting it understates the required audit rate by exactly the fraction
     /// of the window it consumes.
     pub profile_warmup_epochs: usize,
+    /// Number of time scales in the coupling ladder
+    /// (`MonitorConfig::scale_ladder`).
+    ///
+    /// Running several concurrently removes the need to guess the adversary's
+    /// patience, at a one-time cost of `ln(n)` nats — added to the evidence
+    /// requirement here rather than left implicit.
+    pub n_time_scales: usize,
+    /// Longest block in that ladder, in epochs.
+    ///
+    /// The slowest scale reports only on block boundaries, so a detection it
+    /// drives can land up to this many epochs after the evidence was actually
+    /// present. Charged against the window as worst-case granularity.
+    pub slowest_scale_epochs: usize,
 }
 
 impl Default for PlanParams {
@@ -103,6 +116,8 @@ impl Default for PlanParams {
             expected_halt_latency_ms: 30_000,
             measured_log_evidence_per_epoch: None,
             profile_warmup_epochs: 20,
+            n_time_scales: 3,
+            slowest_scale_epochs: 25,
         }
     }
 }
@@ -212,15 +227,18 @@ pub fn required_audit_rate(p: &PlanParams) -> PlanResult {
     }
 
     let raw_epochs = detection_window_ms as f64 / p.epoch_duration_ms.max(1) as f64;
-    // Warm-up is spent inside the window, not before it.
-    let epochs_available = (raw_epochs - p.profile_warmup_epochs as f64).max(0.0);
+    // Warm-up and worst-case block granularity are both spent inside the window,
+    // not before it.
+    let dead_epochs = p.profile_warmup_epochs as f64 + p.slowest_scale_epochs.saturating_sub(1) as f64;
+    let epochs_available = (raw_epochs - dead_epochs).max(0.0);
 
     if epochs_available <= 0.0 {
         findings.push(format!(
-            "the profile warm-up ({} epochs) consumes the entire detection window \
-             ({raw_epochs:.0} epochs): L2 never emits evidence before the deadline. \
-             Shorten the warm-up, shorten the epoch, or rely on L0/L1 for this goal.",
-            p.profile_warmup_epochs
+            "warm-up ({} epochs) plus the slowest time scale ({} epochs) consumes the \
+             entire detection window ({raw_epochs:.0} epochs): L2 never emits evidence \
+             before the deadline. Shorten the warm-up or the ladder, shorten the epoch, \
+             or rely on L0/L1 for this goal.",
+            p.profile_warmup_epochs, p.slowest_scale_epochs
         ));
         return PlanResult {
             required_audit_rate: f64::INFINITY,
@@ -235,16 +253,20 @@ pub fn required_audit_rate(p: &PlanParams) -> PlanResult {
         };
     }
 
-    if p.profile_warmup_epochs as f64 > 0.25 * raw_epochs {
+    if dead_epochs > 0.25 * raw_epochs {
         findings.push(format!(
-            "the profile warm-up ({} epochs) consumes {:.0}% of the detection window; \
-             it is detection latency and is already charged against the budget here",
-            p.profile_warmup_epochs,
-            100.0 * p.profile_warmup_epochs as f64 / raw_epochs
+            "warm-up plus slowest scale ({:.0} epochs) consumes {:.0}% of the detection \
+             window; both are detection latency and are already charged against the \
+             budget here",
+            dead_epochs,
+            100.0 * dead_epochs / raw_epochs
         ));
     }
 
-    let needed = ville_threshold(p.alpha) / per_epoch;
+    // The scale ladder is tested simultaneously via a fixed-prior mixture, so
+    // its multiplicity costs ln(n) nats once — not a per-epoch correction.
+    let ladder_cost = (p.n_time_scales.max(1) as f64).ln();
+    let needed = (ville_threshold(p.alpha) + ladder_cost) / per_epoch;
     let rate = needed / epochs_available;
     let feasible = rate <= 1.0;
 
@@ -395,6 +417,8 @@ mod tests {
             expected_halt_latency_ms: 1_000,
             measured_log_evidence_per_epoch: Some(0.05),
             profile_warmup_epochs: 0,
+            n_time_scales: 1,
+            slowest_scale_epochs: 1,
             ..Default::default()
         };
         let r = required_audit_rate(&p);
@@ -414,6 +438,7 @@ mod tests {
             t_irreversible_ms: 8_000,
             expected_halt_latency_ms: 1_000,
             profile_warmup_epochs: 20,
+            slowest_scale_epochs: 1,
             measured_log_evidence_per_epoch: Some(5.0),
             ..Default::default()
         };
@@ -432,6 +457,8 @@ mod tests {
             expected_halt_latency_ms: 0,
             measured_log_evidence_per_epoch: Some(0.2),
             profile_warmup_epochs: 0,
+            n_time_scales: 1,
+            slowest_scale_epochs: 1,
             ..Default::default()
         };
         let warmed = PlanParams {
@@ -516,6 +543,53 @@ mod tests {
         let a = required_audit_rate(&optimistic);
         let b = required_audit_rate(&realistic);
         assert!((b.required_audit_rate / a.required_audit_rate - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_scale_ladder_is_charged_as_a_one_time_cost_not_a_per_epoch_one() {
+        let one = PlanParams {
+            n_time_scales: 1,
+            slowest_scale_epochs: 1,
+            profile_warmup_epochs: 0,
+            measured_log_evidence_per_epoch: Some(0.2),
+            ..Default::default()
+        };
+        let many = PlanParams {
+            n_time_scales: 8,
+            ..one.clone()
+        };
+        let a = required_audit_rate(&one);
+        let b = required_audit_rate(&many);
+
+        // Eight scales add ln(8) = 2.08 nats to a ln(1000) = 6.91 requirement:
+        // about 30% more evidence, once. A per-epoch correction would scale with
+        // the horizon instead and be ruinous.
+        let ratio = b.epochs_needed_at_full_audit / a.epochs_needed_at_full_audit;
+        assert!(
+            (ratio - (ville_threshold(1e-3) + 8f64.ln()) / ville_threshold(1e-3)).abs() < 1e-9,
+            "ladder cost {ratio} is not the expected one-time ln(n) penalty"
+        );
+        assert!(ratio < 1.35);
+    }
+
+    #[test]
+    fn the_slowest_scale_is_charged_as_window_granularity() {
+        let fast = PlanParams {
+            epoch_duration_ms: 1_000,
+            t_irreversible_ms: 200_000,
+            expected_halt_latency_ms: 0,
+            profile_warmup_epochs: 0,
+            n_time_scales: 1,
+            slowest_scale_epochs: 1,
+            measured_log_evidence_per_epoch: Some(0.2),
+            ..Default::default()
+        };
+        let slow = PlanParams {
+            slowest_scale_epochs: 101,
+            ..fast.clone()
+        };
+        assert_eq!(required_audit_rate(&fast).epochs_available, 200.0);
+        assert_eq!(required_audit_rate(&slow).epochs_available, 100.0);
     }
 
     #[test]

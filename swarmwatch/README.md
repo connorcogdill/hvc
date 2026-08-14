@@ -14,7 +14,7 @@ different answers:
    specific transfer in front of them.
 
 ```
-cargo test                                     # 192 tests
+cargo test                                     # 203 tests
 cargo run --release --bin swarmwatch-demo      # full protocol, six scenarios
 cargo run --release --bin swarmwatch-probe     # calibration check; exits non-zero on failure
 ```
@@ -212,15 +212,48 @@ applied to all of them. What the control-centring was trying to remove, the rank
 test removes for free.
 
 The cost is a **warm-up**: the first ~20 epochs estimate per-session moments and
-emit nothing. That is dead time inside the detection window, so
-`planning::required_audit_rate` charges it against the budget rather than
-treating it as free.
+emit nothing. That is dead time inside the detection window, as is the worst-case
+wait for the slowest block to close, so `planning::required_audit_rate` charges
+both against the budget rather than treating them as free.
 
 **A swarm-level alternative.** The alternative is "*some unknown subset*
 coordinates" — `2ⁿ` hypotheses. A pre-registered mixture pays the multiplicity
 cost **once, as a prior penalty** (~2–7 nats), rather than re-paying a Bonferroni
 correction at every epoch. Attribution falls out of the same computation: the
 posterior `π(S)·E_S` names the implicated sessions at the moment of detection.
+
+**A ladder of time scales, not a chosen one.** A per-epoch coupling score is
+noisy, and a patient swarm hides under that noise — this is the dilution argument
+working exactly as advertised. Averaging coupling over a window of `W` epochs
+raises SNR roughly as `√W`, but delays the verdict until the window closes.
+Measured on a three-session swarm, median epoch of first crossing:
+
+| coupling | W=1 | W=5 | W=25 | **mixture** |
+|---|---|---|---|---|
+| 1.4 | **33** | 54 | 194 | **36** |
+| 0.8 | never | **119** | 219 | **134** |
+| 0.6 | never | never | **469** | **519** |
+
+No scale dominates, and tuning `W` requires knowing how patient the adversary
+is — precisely what is unknown, and something the adversary chooses *after*
+seeing the monitor. So all of them run concurrently: a fixed-prior mixture of
+e-processes is itself an e-process under arbitrary dependence, so the whole
+ladder is tested simultaneously at level `α` for a one-time `ln(#scales)` — about
+1.1 nats for three. That roughly **halves the weakest detectable coupling**, from
+about 1.0 to about 0.6, while costing ~3 epochs on swarms the fast scale already
+catches.
+
+The firing scale is itself intelligence. A detection driven by the 25-epoch block
+means the swarm spread its coordination thin enough that no single epoch looked
+unusual — a different adversary from one caught at a single epoch, warranting a
+different response. `MultiScaleVerdict::dominant_scale` reports it.
+
+One implementation detail is a correctness requirement rather than a nicety: the
+mixture is taken over each scale's **current** e-value, never its running peak. A
+peak is monotone non-decreasing, so a mixture of peaks can never fall and is not
+a supermartingale — Ville's inequality does not cover it. Measured, that mistake
+produced *positive* null drift (`+0.00004` nats/epoch, which fires on a clean
+population eventually); mixing current values returned it to `−0.021`.
 
 **`f` inverted.** The observation fraction is the red team's design variable and
 the defender's *budget*. `planning::required_audit_rate` solves the same Stein
@@ -275,8 +308,10 @@ indistinguishable from a broken one.
   understood the mechanism and paid to defeat it is not.
 - **Goals whose preconditions were not enumerated.** Tripwires only cover paths
   someone thought of. This is why L2 exists as a backstop.
-- **A signal quieter than the monitor is provisioned for.**
-  `planning::weakest_detectable_signal` states that threshold in advance, so the
+- **A signal quieter than the monitor is provisioned for.** The scale ladder
+  lowers that floor by roughly half but does not remove it: coupling around 0.4
+  and below is out of reach at this control budget and horizon.
+  `planning::weakest_detectable_signal` states the threshold in advance, so the
   exposure is published rather than discovered.
 - **Attribution is progressive.** The mixture posterior concentrates, so the
   implicated set at firing time is a **coupled core, not a census**. Halt the
@@ -295,7 +330,7 @@ and instrumentation is fixable.
 | `conformal` | epoch-wise conformal calibration against concurrent controls |
 | `population` | control population, self-referential standardisation, residuals |
 | `coupling` | pairwise and directed coupling; donor/recipient orientation |
-| `swarm` | subset-mixture detector and attribution posterior |
+| `swarm` | subset-mixture detector, time-scale ladder, attribution posterior |
 | `canary` | load-bearing canary tokens, transform-robust scanning |
 | `tripwire` | deterministic predicates, sealed under a commitment hash |
 | `consent` | replication grants, disclosure, comprehension, policy caps |

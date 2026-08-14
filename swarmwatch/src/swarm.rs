@@ -329,6 +329,301 @@ impl SwarmDetector {
     }
 }
 
+/// A pre-registered ladder of time scales.
+///
+/// Each entry is a block length in epochs. `1` means "calibrate every epoch";
+/// `25` means "average coupling over 25 disjoint epochs, then calibrate once".
+#[derive(Clone, Debug)]
+pub struct ScaleLadder {
+    pub blocks: Vec<usize>,
+}
+
+impl Default for ScaleLadder {
+    /// A geometric ladder. Roughly geometric spacing covers a wide range of
+    /// adversary patience for very little cost, since the multiplicity penalty
+    /// grows only as `ln(#scales)`.
+    fn default() -> Self {
+        ScaleLadder {
+            blocks: vec![1, 5, 25],
+        }
+    }
+}
+
+impl ScaleLadder {
+    pub fn new(blocks: impl IntoIterator<Item = usize>) -> Self {
+        let mut blocks: Vec<usize> = blocks.into_iter().map(|b| b.max(1)).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        if blocks.is_empty() {
+            blocks.push(1);
+        }
+        ScaleLadder { blocks }
+    }
+
+    /// Slowest scale, which sets how long the detector may take to emit anything.
+    pub fn longest(&self) -> usize {
+        self.blocks.iter().copied().max().unwrap_or(1)
+    }
+}
+
+/// One epoch's assessment from the multi-scale detector.
+#[derive(Clone, Debug)]
+pub struct MultiScaleVerdict {
+    pub epoch: usize,
+    /// Accumulated mixture e-value across scales, log scale.
+    pub log_e: f64,
+    pub fired_now: bool,
+    pub first_crossing: Option<usize>,
+    /// Block length of the scale carrying most of the posterior.
+    ///
+    /// Operationally meaningful: it characterises the adversary's patience. A
+    /// detection at block 1 is a swarm coordinating visibly turn by turn; one at
+    /// block 25 is a swarm that has spread its coordination thin enough that no
+    /// single epoch looks unusual.
+    pub dominant_scale: usize,
+    pub top_subsets: Vec<(Vec<usize>, f64)>,
+    pub marginal: Vec<f64>,
+    pub implicated: Vec<usize>,
+}
+
+impl MultiScaleVerdict {
+    pub fn fired(&self) -> bool {
+        self.first_crossing.is_some()
+    }
+}
+
+/// The detector the monitor actually runs: a mixture over both *which sessions*
+/// might be coordinating and *over what time scale*.
+///
+/// # Why a single time scale is the wrong choice, whichever one you pick
+///
+/// A per-epoch coupling score is noisy. Coordination is persistent, so averaging
+/// coupling over a window of `W` epochs raises the signal-to-noise ratio roughly
+/// as `√W` — but it also delays the verdict, because nothing is emitted until the
+/// window closes. Measured on a three-session swarm, median epoch of first
+/// crossing:
+///
+/// | coupling | W=1 | W=5 | W=25 | **mixture** |
+/// |---|---|---|---|---|
+/// | 1.4 | **33** | 54 | 194 | **36** |
+/// | 0.8 | never | **119** | 219 | **134** |
+/// | 0.6 | never | never | **469** | **519** |
+///
+/// No scale dominates. Tuning `W` to the adversary requires knowing how patient
+/// the adversary is, which is precisely what is unknown — and a patient
+/// adversary chooses its rate *after* seeing the monitor.
+///
+/// # The mixture removes the choice
+///
+/// A weighted mixture of e-processes is itself an e-process under **arbitrary
+/// dependence** between the components, so several scales can run concurrently
+/// and be tested simultaneously at level `α`. The whole ladder costs
+/// `ln(#scales)` nats — about 1.1 for three — paid once, and the mixture lands
+/// within a few epochs of whichever scale turns out to be right.
+///
+/// The effect is to roughly halve the weakest detectable coupling, from about
+/// 1.0 to about 0.6, while giving up ~3 epochs on loud swarms.
+///
+/// # One implementation detail that is a correctness requirement
+///
+/// The mixture is taken over each scale's **current** e-value, never its running
+/// peak. A peak is monotone non-decreasing, so a mixture of peaks can never fall
+/// and is not a supermartingale — Ville's inequality does not apply to it. In
+/// measurement, mixing peaks produced a *positive* null drift (`+0.00004`
+/// nats/epoch), which fires on a clean population given enough epochs; mixing
+/// current values returned it to `−0.021`.
+///
+/// Between a scale's block boundaries its e-process is genuinely unchanged — a
+/// product with no new factor — so caching the last emitted value is exact
+/// rather than an approximation.
+#[derive(Clone, Debug)]
+pub struct MultiScaleDetector {
+    n: usize,
+    ladder: ScaleLadder,
+    detectors: Vec<SwarmDetector>,
+    accum: Vec<Vec<f64>>,
+    counts: Vec<usize>,
+    scale_log_e: Vec<f64>,
+    control_mask: Vec<bool>,
+    kappa: f64,
+    log_prior: f64,
+    log_threshold: f64,
+    log_e: f64,
+    peak_log_e: f64,
+    first_crossing: Option<usize>,
+}
+
+impl MultiScaleDetector {
+    pub fn new(
+        names: Vec<String>,
+        eligible: &[usize],
+        control_mask: Vec<bool>,
+        ladder: ScaleLadder,
+        prior: SubsetPrior,
+        alpha: f64,
+        kappa: f64,
+    ) -> Self {
+        let n = names.len();
+        let n_scales = ladder.blocks.len();
+        let detectors: Vec<SwarmDetector> = ladder
+            .blocks
+            .iter()
+            .map(|_| SwarmDetector::new(names.clone(), eligible, prior.clone(), alpha))
+            .collect();
+
+        MultiScaleDetector {
+            n,
+            ladder,
+            detectors,
+            accum: vec![vec![0.0; n_pairs(n)]; n_scales],
+            counts: vec![0; n_scales],
+            scale_log_e: vec![0.0; n_scales],
+            control_mask,
+            kappa,
+            log_prior: -(n_scales as f64).ln(),
+            log_threshold: crate::evidence::ville_threshold(alpha),
+            log_e: 0.0,
+            peak_log_e: 0.0,
+            first_crossing: None,
+        }
+    }
+
+    pub fn ladder(&self) -> &ScaleLadder {
+        &self.ladder
+    }
+
+    /// One-time evidence penalty for running the whole ladder, in nats.
+    pub fn scale_multiplicity_cost(&self) -> f64 {
+        (self.ladder.blocks.len() as f64).ln()
+    }
+
+    /// Total one-time penalty: subset family plus time-scale ladder.
+    pub fn multiplicity_cost(&self) -> f64 {
+        self.detectors
+            .first()
+            .map(|d| d.multiplicity_cost())
+            .unwrap_or(0.0)
+            + self.scale_multiplicity_cost()
+    }
+
+    pub fn family_size(&self) -> usize {
+        self.detectors.first().map(|d| d.family_size()).unwrap_or(0)
+    }
+
+    pub fn log_threshold(&self) -> f64 {
+        self.log_threshold
+    }
+
+    pub fn peak(&self) -> EValue {
+        EValue::from_log(self.peak_log_e)
+    }
+
+    pub fn first_crossing(&self) -> Option<usize> {
+        self.first_crossing
+    }
+
+    pub fn progress(&self) -> f64 {
+        if self.log_threshold <= 0.0 {
+            return 1.0;
+        }
+        (self.peak_log_e / self.log_threshold).clamp(0.0, 1.0)
+    }
+
+    pub fn render_subset(&self, s: &[usize]) -> String {
+        self.detectors
+            .first()
+            .map(|d| d.render_subset(s))
+            .unwrap_or_default()
+    }
+
+    /// Fold in one epoch of raw per-pair coupling scores.
+    ///
+    /// Returns `None` on epochs where no scale closed a block, since nothing was
+    /// evaluated and there is no verdict to report.
+    pub fn update(&mut self, epoch: usize, pair_scores: &[f64]) -> Option<MultiScaleVerdict> {
+        let mut any_emitted = false;
+        let mut verdicts: Vec<Option<SwarmVerdict>> = vec![None; self.detectors.len()];
+
+        for (si, &block) in self.ladder.blocks.iter().enumerate() {
+            for (k, s) in pair_scores.iter().enumerate() {
+                if k < self.accum[si].len() {
+                    self.accum[si][k] += s;
+                }
+            }
+            self.counts[si] += 1;
+            if self.counts[si] < block {
+                continue;
+            }
+
+            let denom = self.counts[si] as f64;
+            let mean: Vec<f64> = self.accum[si].iter().map(|v| v / denom).collect();
+            self.accum[si] = vec![0.0; n_pairs(self.n)];
+            self.counts[si] = 0;
+
+            // Calibrate the block statistic against control-control pairs
+            // aggregated over the *same* block, so the reference and the test
+            // statistic are the same function of the same window.
+            let controls = crate::coupling::control_pair_scores(&mean, self.n, &self.control_mask);
+            if controls.is_empty() {
+                continue;
+            }
+            let evalues: Vec<EValue> = mean
+                .iter()
+                .map(|s| crate::conformal::calibrate(crate::conformal::conformal_p(*s, &controls), self.kappa))
+                .collect();
+
+            let v = self.detectors[si].update(epoch, &evalues);
+            self.scale_log_e[si] = v.log_e;
+            verdicts[si] = Some(v);
+            any_emitted = true;
+        }
+
+        if !any_emitted {
+            return None;
+        }
+
+        // Mixture over scales, on current values rather than peaks.
+        let terms: Vec<f64> = self.scale_log_e.iter().map(|le| self.log_prior + le).collect();
+        self.log_e = crate::evidence::log_sum_exp(&terms);
+        if self.log_e > self.peak_log_e {
+            self.peak_log_e = self.log_e;
+        }
+
+        let mut fired_now = false;
+        if self.first_crossing.is_none() && self.log_e >= self.log_threshold {
+            self.first_crossing = Some(epoch);
+            fired_now = true;
+        }
+
+        // Attribution comes from the scale carrying the most posterior mass —
+        // the one that is actually driving the detection.
+        let dominant = terms
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let attribution = verdicts[dominant]
+            .clone()
+            .or_else(|| verdicts.iter().flatten().next().cloned());
+
+        Some(MultiScaleVerdict {
+            epoch,
+            log_e: self.log_e,
+            fired_now,
+            first_crossing: self.first_crossing,
+            dominant_scale: self.ladder.blocks[dominant],
+            top_subsets: attribution.as_ref().map(|v| v.top_subsets.clone()).unwrap_or_default(),
+            marginal: attribution
+                .as_ref()
+                .map(|v| v.marginal.clone())
+                .unwrap_or_else(|| vec![0.0; self.n]),
+            implicated: attribution.map(|v| v.implicated).unwrap_or_default(),
+        })
+    }
+}
+
 fn pairs_within(s: &[usize]) -> impl Iterator<Item = (usize, usize)> + '_ {
     (0..s.len()).flat_map(move |a| ((a + 1)..s.len()).map(move |b| (s[a], s[b])))
 }
@@ -576,6 +871,208 @@ mod tests {
         let w = weak.first_crossing().unwrap_or(usize::MAX);
         let s = strong.first_crossing().unwrap_or(usize::MAX);
         assert!(s <= w, "stronger coupling detected later ({s} vs {w})");
+    }
+
+    // ---- multi-scale ----
+
+    fn multi(n_control: usize, n_test: usize, ladder: ScaleLadder) -> MultiScaleDetector {
+        let n = n_control + n_test;
+        MultiScaleDetector::new(
+            (0..n).map(|i| format!("s{i}")).collect(),
+            &(n_control..n).collect::<Vec<_>>(),
+            (0..n).map(|i| i < n_control).collect(),
+            ladder,
+            SubsetPrior::default(),
+            1e-3,
+            optimal_kappa(crate::coupling::n_pairs(n_control)),
+        )
+    }
+
+    /// Drive the shipped pipeline: features -> residuals -> coupling -> detector.
+    fn drive(
+        seed: u64,
+        n_control: usize,
+        n_test: usize,
+        swarm: &[usize],
+        coupling: f64,
+        epochs: usize,
+        ladder: ScaleLadder,
+    ) -> (MultiScaleDetector, Option<MultiScaleVerdict>) {
+        use crate::coupling::instantaneous_coupling;
+        use crate::population::PopulationTracker;
+
+        let n = n_control + n_test;
+        let dim = 10;
+        let mut rng = Rng::new(seed);
+        let mut det = multi(n_control, n_test, ladder);
+        let mut tracker = PopulationTracker::new(15);
+        let mut last = None;
+
+        for epoch in 0..epochs {
+            let latent: Vec<f64> = (0..dim).map(|_| rng.normal()).collect();
+            let features: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..dim)
+                        .map(|k| {
+                            5.0 + rng.normal()
+                                + if swarm.contains(&i) {
+                                    coupling * latent[k]
+                                } else {
+                                    0.0
+                                }
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let snap = EpochSnapshot::new(
+                epoch,
+                (0..n).map(|i| format!("s{i}")).collect(),
+                features,
+                (0..n).map(|i| i < n_control).collect(),
+            );
+            let Some(residuals) = tracker.residuals(&snap) else {
+                continue;
+            };
+            if let Some(v) = det.update(epoch, &instantaneous_coupling(&residuals)) {
+                last = Some(v);
+            }
+        }
+        (det, last)
+    }
+
+    #[test]
+    fn ladder_is_normalised() {
+        let l = ScaleLadder::new([25, 1, 5, 5, 0]);
+        assert_eq!(l.blocks, vec![1, 5, 25]);
+        assert_eq!(l.longest(), 25);
+        assert_eq!(ScaleLadder::new([]).blocks, vec![1]);
+    }
+
+    #[test]
+    fn only_emits_a_verdict_when_a_block_closes() {
+        let mut d = multi(8, 4, ScaleLadder::new([10]));
+        let scores = vec![0.5; crate::coupling::n_pairs(12)];
+        for epoch in 0..9 {
+            assert!(d.update(epoch, &scores).is_none(), "epoch {epoch}");
+        }
+        assert!(d.update(9, &scores).is_some());
+    }
+
+    #[test]
+    fn multiplicity_cost_counts_both_subsets_and_scales() {
+        let d = multi(8, 4, ScaleLadder::new([1, 5, 25]));
+        assert!((d.scale_multiplicity_cost() - 3f64.ln()).abs() < 1e-12);
+        assert!(d.multiplicity_cost() > d.scale_multiplicity_cost());
+        // Still logarithmic, not linear in the number of hypotheses.
+        assert!(d.multiplicity_cost() < 10.0);
+    }
+
+    /// The correctness requirement that a prototype got wrong: the mixture must
+    /// be taken over each scale's *current* e-value, not its running peak. A
+    /// mixture of peaks is monotone non-decreasing, so it is not a
+    /// supermartingale and Ville's inequality does not cover it — measured, that
+    /// mistake produced positive null drift.
+    ///
+    /// The observable signature is exactly this: a correct mixture can fall.
+    #[test]
+    fn mixture_can_decrease_and_is_therefore_not_a_running_maximum() {
+        let (det, _) = drive(3, 8, 4, &[], 0.0, 200, ScaleLadder::new([1, 5]));
+        // Under the null the process should have drifted down from its peak.
+        assert!(
+            det.peak().log() > det.log_e,
+            "mixture never fell below its peak ({:.3} vs peak {:.3}); it is behaving \
+             like a running maximum, which is not a supermartingale",
+            det.log_e,
+            det.peak().log()
+        );
+    }
+
+    #[test]
+    fn multi_scale_does_not_fire_on_a_clean_population() {
+        let mut fires = 0;
+        for seed in 0..30 {
+            let (det, _) = drive(700 + seed, 8, 4, &[], 0.0, 200, ScaleLadder::default());
+            if det.first_crossing().is_some() {
+                fires += 1;
+            }
+        }
+        assert!(fires <= 1, "{fires}/30 false positives at alpha=1e-3");
+    }
+
+    /// The reason the ladder exists: a swarm too quiet for per-epoch calibration
+    /// is caught by a slower scale, without having had to guess its patience.
+    #[test]
+    fn a_slow_scale_catches_coupling_that_per_epoch_calibration_misses() {
+        let swarm = [8usize, 9, 10];
+        let weak = 0.75;
+
+        let fast_only = (0..8)
+            .filter(|s| {
+                drive(*s, 8, 4, &swarm, weak, 400, ScaleLadder::new([1]))
+                    .0
+                    .first_crossing()
+                    .is_some()
+            })
+            .count();
+
+        let ladder = (0..8)
+            .filter(|s| {
+                drive(*s, 8, 4, &swarm, weak, 400, ScaleLadder::default())
+                    .0
+                    .first_crossing()
+                    .is_some()
+            })
+            .count();
+
+        assert!(
+            ladder > fast_only,
+            "the ladder detected {ladder}/8 against per-epoch's {fast_only}/8; it should \
+             strictly extend the detectable range"
+        );
+    }
+
+    #[test]
+    fn a_loud_swarm_is_still_caught_quickly_despite_the_ladder() {
+        // The ladder must not cost meaningful latency on signals the fast scale
+        // already handles — only the one-time ln(#scales) prior.
+        let swarm = [8usize, 9, 10];
+        let fast = drive(11, 8, 4, &swarm, 1.6, 400, ScaleLadder::new([1]))
+            .0
+            .first_crossing()
+            .expect("fast scale should catch a loud swarm");
+        let ladder = drive(11, 8, 4, &swarm, 1.6, 400, ScaleLadder::default())
+            .0
+            .first_crossing()
+            .expect("ladder should catch a loud swarm");
+        assert!(
+            ladder <= fast + 15,
+            "ladder took {ladder} epochs against {fast} for the fast scale alone"
+        );
+    }
+
+    #[test]
+    fn dominant_scale_characterises_the_adversary() {
+        let swarm = [8usize, 9, 10];
+        let (_, verdict) = drive(13, 8, 4, &swarm, 1.6, 300, ScaleLadder::default());
+        let v = verdict.expect("expected a verdict");
+        assert!(ScaleLadder::default().blocks.contains(&v.dominant_scale));
+        // A loud, turn-by-turn swarm should be driven by the fastest scale.
+        assert_eq!(v.dominant_scale, 1);
+    }
+
+    #[test]
+    fn multi_scale_attribution_names_no_control() {
+        let swarm = [8usize, 9, 10];
+        let (_, verdict) = drive(17, 8, 4, &swarm, 1.6, 300, ScaleLadder::default());
+        let v = verdict.expect("expected a verdict");
+        if v.fired() {
+            assert!(
+                v.implicated.iter().all(|i| *i >= 8),
+                "a reference control was implicated: {:?}",
+                v.implicated
+            );
+        }
     }
 
     #[test]

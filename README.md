@@ -12,7 +12,7 @@ reasoning.
 
 ```sh
 cd swarmwatch
-cargo test                                   # 192 tests
+cargo test                                   # 203 tests
 cargo run --release --bin swarmwatch-demo    # full protocol, six scenarios
 cargo run --release --bin swarmwatch-probe   # calibration check; exits non-zero on failure
 ```

@@ -69,10 +69,13 @@
 //!    so calibration is epoch-wise conformal against **concurrent** reference
 //!    agents — which, as a bonus, is what makes the sequential product a genuine
 //!    test supermartingale. See [`conformal`].
-//! 3. **A swarm-level alternative.** The composite alternative is "some unknown
-//!    subset coordinates", handled by a pre-registered mixture that pays its
-//!    multiplicity cost once as a prior penalty rather than per-epoch — and
-//!    whose posterior yields attribution for free. See [`swarm`].
+//! 3. **A swarm-level alternative, over sessions *and* time scales.** The
+//!    composite alternative is "some unknown subset coordinates, at some unknown
+//!    rate". Both are handled by pre-registered mixtures that pay their
+//!    multiplicity cost once as a prior penalty rather than per-epoch, and whose
+//!    posterior yields attribution — including which time scale is driving the
+//!    detection, which characterises how patient the adversary is. The scale
+//!    ladder roughly halves the weakest detectable coupling. See [`swarm`].
 //! 4. **`f` inverted.** The observation fraction is the red team's design
 //!    variable and the blue team's *budget*. [`planning::required_audit_rate`]
 //!    solves the same Stein relation for how much the operator must look, and
@@ -91,8 +94,9 @@
 //!   adversary that has understood the mechanism and paid to defeat it.
 //! - **Goals whose preconditions were not enumerated.** Tripwires only cover
 //!   paths someone thought of. This is the honest limit, and why L2 exists.
-//! - **A signal quieter than the monitor is provisioned for.**
-//!   [`planning::weakest_detectable_signal`] states that threshold in advance so
+//! - **A signal quieter than the monitor is provisioned for.** The scale ladder
+//!   lowers that floor but does not remove it.
+//!   [`planning::weakest_detectable_signal`] states the threshold in advance so
 //!   it is published rather than discovered.
 //!
 //! What none of these are is an information-theoretic wall. They are
@@ -140,8 +144,14 @@
 //!
 //! Run `cargo run --release --bin swarmwatch-demo` for the full protocol: a
 //! negative control, a canary condition, the four consent-gate properties, a
-//! covert swarm caught by population coupling, and a gate bypass caught by the
-//! census.
+//! covert swarm caught by population coupling, a patient swarm caught only by the
+//! slow end of the scale ladder, and a gate bypass caught by the census.
+//!
+//! Run `cargo run --release --bin swarmwatch-probe` before trusting any of it. It
+//! measures **null drift** — evidence accumulated per epoch with nothing
+//! coordinating — which is the quantity a clean negative-control run can hide. A
+//! detector with positive drift alarms on a healthy population eventually, at any
+//! `α`. The probe exits non-zero on failure, so it can gate a deployment.
 //!
 //! ## Zero dependencies
 //!

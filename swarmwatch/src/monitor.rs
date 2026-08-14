@@ -37,7 +37,7 @@
 //! [`SwarmMonitor::readiness`] before the run and a canary condition during it.
 
 use crate::canary::CanaryScanner;
-use crate::conformal::{calibrate, conformal_p, optimal_kappa};
+use crate::conformal::optimal_kappa;
 use crate::consent::{
     Admission, Attestation, ComprehensionCheck, ConsentAuthority, Disclosure, Grant, Refusal,
     ReplicationRequest, Scope,
@@ -45,12 +45,11 @@ use crate::consent::{
 use crate::coupling::{
     control_pair_scores, directed_coupling, instantaneous_coupling, n_pairs, rank_edges,
 };
-use crate::evidence::EValue;
 use crate::lineage::{Anchor, InstanceRecord, LineageGraph, LineageLedger};
 use crate::margin::{ContainmentReport, DetectionRecord, Timeline};
 use crate::population::{EpochSnapshot, PopulationTracker};
 use crate::rng::Rng;
-use crate::swarm::{SubsetPrior, SwarmDetector};
+use crate::swarm::{MultiScaleDetector, ScaleLadder, SubsetPrior};
 use crate::tier::{Channel, InstrumentationPlan, Precondition, Tier, TierAudit};
 use crate::tripwire::{replication_tripwires, Response, TripwireRegistry};
 use std::collections::HashSet;
@@ -62,6 +61,12 @@ pub struct MonitorConfig {
     /// `None` selects [`optimal_kappa`] for the available control pairs.
     pub kappa: Option<f64>,
     pub subset_prior: SubsetPrior,
+    /// Time scales the coupling statistic is aggregated over, in epochs.
+    ///
+    /// A per-epoch score is noisy and a patient swarm hides under it; averaging
+    /// over a window trades latency for sensitivity. Running a ladder removes the
+    /// need to guess the adversary's patience — see [`MultiScaleDetector`].
+    pub scale_ladder: ScaleLadder,
     /// Fraction of epochs actually inspected. Set from
     /// [`crate::planning::required_audit_rate`], not by intuition.
     pub audit_rate: f64,
@@ -82,6 +87,7 @@ impl Default for MonitorConfig {
             alpha: 1e-3,
             kappa: None,
             subset_prior: SubsetPrior::default(),
+            scale_ladder: ScaleLadder::default(),
             audit_rate: 1.0,
             anchor_interval_ms: 60_000,
             seed: 0xA11CE,
@@ -182,7 +188,7 @@ pub struct SwarmMonitor {
 
     session_names: Vec<String>,
     control_mask: Vec<bool>,
-    detector: Option<SwarmDetector>,
+    detector: Option<MultiScaleDetector>,
 
     events: Vec<DetectionEvent>,
     issued_grants: HashSet<String>,
@@ -299,11 +305,14 @@ impl SwarmMonitor {
             .kappa
             .unwrap_or_else(|| optimal_kappa(n_control_pairs));
 
-        self.detector = Some(SwarmDetector::new(
+        self.detector = Some(MultiScaleDetector::new(
             self.session_names.clone(),
             &eligible,
+            self.control_mask.clone(),
+            self.config.scale_ladder.clone(),
             self.config.subset_prior.clone(),
             self.config.alpha,
+            self.kappa,
         ));
 
         self.sealed_population = self.session_names.len();
@@ -359,6 +368,13 @@ impl SwarmMonitor {
                  population-relative statistic can separate it"
                     .into(),
             );
+        }
+        let slowest = self.config.scale_ladder.longest();
+        if slowest > 1 {
+            warnings.push(format!(
+                "the slowest time scale aggregates over {slowest} epochs, so L2 can only \
+                 report on block boundaries; budget it alongside the warm-up"
+            ));
         }
         if self.config.profile_warmup_epochs > 0 {
             warnings.push(format!(
@@ -461,16 +477,9 @@ impl SwarmMonitor {
             return Vec::new(); // still warming up
         };
         let scores = instantaneous_coupling(&residuals);
-        let controls = control_pair_scores(&scores, n, &snapshot.control_mask);
-
-        if controls.is_empty() {
+        if control_pair_scores(&scores, n, &snapshot.control_mask).is_empty() {
             return Vec::new();
         }
-
-        let evalues: Vec<EValue> = scores
-            .iter()
-            .map(|s| calibrate(conformal_p(*s, &controls), self.kappa))
-            .collect();
 
         // Lagged directed coupling, computed before the detector borrows self.
         // This is a *signed* statistic: a common cause acting on both sessions
@@ -486,7 +495,11 @@ impl SwarmMonitor {
         let Some(det) = self.detector.as_mut() else {
             return Vec::new();
         };
-        let verdict = det.update(snapshot.epoch, &evalues);
+        // The detector aggregates over its own scale ladder and calibrates each
+        // block internally; `None` means no scale closed a block this epoch.
+        let Some(verdict) = det.update(snapshot.epoch, &scores) else {
+            return Vec::new();
+        };
 
         if !verdict.fired_now {
             return Vec::new();
@@ -521,10 +534,11 @@ impl SwarmMonitor {
 
         let detail = format!(
             "swarm e-process crossed Ville threshold (log E = {:.2} ≥ {:.2}) after {} audited \
-             epoch(s){orientation}",
+             epoch(s); dominant time scale {} epoch(s){orientation}",
             verdict.log_e,
             det.log_threshold(),
-            self.audited_epochs
+            self.audited_epochs,
+            verdict.dominant_scale
         );
 
         self.push_event(snapshot.epoch, timestamp_ms, "swarm-evalue", detail, implicated)
@@ -769,7 +783,7 @@ impl SwarmMonitor {
         &self.authority
     }
 
-    pub fn detector(&self) -> Option<&SwarmDetector> {
+    pub fn detector(&self) -> Option<&MultiScaleDetector> {
         self.detector.as_ref()
     }
 

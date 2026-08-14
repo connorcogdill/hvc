@@ -28,12 +28,11 @@
 //! cargo run --release --bin swarmwatch-probe
 //! ```
 
-use swarmwatch::conformal::{calibrate, conformal_p, optimal_kappa};
-use swarmwatch::coupling::{control_pair_scores, instantaneous_coupling, n_pairs};
-use swarmwatch::evidence::EValue;
+use swarmwatch::conformal::optimal_kappa;
+use swarmwatch::coupling::{instantaneous_coupling, n_pairs};
 use swarmwatch::population::{EpochSnapshot, PopulationTracker};
 use swarmwatch::rng::Rng;
-use swarmwatch::swarm::{SubsetPrior, SwarmDetector};
+use swarmwatch::swarm::{MultiScaleDetector, ScaleLadder, SubsetPrior};
 
 const N_CONTROL: usize = 8;
 const N_TEST: usize = 4;
@@ -53,14 +52,28 @@ struct Outcome {
 /// "these agents are doing a different job", not "these agents are colluding".
 /// `coupling` adds a genuine per-epoch shared latent to the first `n_members`
 /// test sessions, which is coordination.
-fn run(seed: u64, epochs: usize, profile_shift: f64, coupling: f64, n_members: usize) -> Outcome {
+fn run(
+    seed: u64,
+    epochs: usize,
+    profile_shift: f64,
+    coupling: f64,
+    n_members: usize,
+    ladder: ScaleLadder,
+) -> Outcome {
     let n = N_CONTROL + N_TEST;
     let mut rng = Rng::new(seed ^ 0xBEEF);
     let names: Vec<String> = (0..n).map(|i| format!("s{i}")).collect();
     let eligible: Vec<usize> = (N_CONTROL..n).collect();
 
-    let mut det = SwarmDetector::new(names.clone(), &eligible, SubsetPrior::default(), ALPHA);
-    let kappa = optimal_kappa(n_pairs(N_CONTROL));
+    let mut det = MultiScaleDetector::new(
+        names.clone(),
+        &eligible,
+        (0..n).map(|i| i < N_CONTROL).collect(),
+        ladder,
+        SubsetPrior::default(),
+        ALPHA,
+        optimal_kappa(n_pairs(N_CONTROL)),
+    );
     let mut tracker = PopulationTracker::new(WARMUP);
 
     let offset: Vec<f64> = (0..DIM).map(|_| rng.normal()).collect();
@@ -97,14 +110,9 @@ fn run(seed: u64, epochs: usize, profile_shift: f64, coupling: f64, n_members: u
             continue; // warm-up
         };
 
-        let scores = instantaneous_coupling(&residuals);
-        let controls = control_pair_scores(&scores, n, &snapshot.control_mask);
-        let evalues: Vec<EValue> = scores
-            .iter()
-            .map(|s| calibrate(conformal_p(*s, &controls), kappa))
-            .collect();
-
-        let verdict = det.update(epoch, &evalues);
+        let Some(verdict) = det.update(epoch, &instantaneous_coupling(&residuals)) else {
+            continue; // no scale closed a block this epoch
+        };
         last_log_e = verdict.log_e;
         emitting += 1;
 
@@ -135,7 +143,10 @@ fn main() {
         "{N_CONTROL} reference agents, {N_TEST} sessions under test, alpha = {ALPHA:.0e}, \
          warm-up {WARMUP} epochs"
     );
-    println!("{seeds} runs per row, 600 epochs each.\n");
+    println!(
+        "scale ladder {:?}, {seeds} runs per row.\n",
+        ScaleLadder::default().blocks
+    );
 
     println!("NULL — nothing is coordinating. Drift must be <= 0.");
     println!(
@@ -148,7 +159,7 @@ fn main() {
         let mut drift = 0.0;
         let mut fired = 0;
         for seed in 0..seeds {
-            let o = run(seed, 600, shift, 0.0, 0);
+            let o = run(seed, 900, shift, 0.0, 0, ScaleLadder::default());
             drift += o.drift;
             if o.fired_at.is_some() {
                 fired += 1;
@@ -174,34 +185,42 @@ fn main() {
         );
     }
 
-    println!("\nALTERNATIVE — a genuine coordinating subset.");
+    println!("\nALTERNATIVE — a genuine coordinating subset, 3 members, 1200 epoch horizon.");
+    println!("Per-epoch calibration alone against the full ladder, median epoch / rate.");
     println!(
-        "  {:>10}  {:>8}  {:>10}  {:>14}  {:>8}",
-        "mismatch", "members", "coupling", "median epoch", "rate"
+        "  {:>10}  {:>10}  {:>18}  {:>18}",
+        "mismatch", "coupling", "per-epoch only", "ladder [1,5,25]"
     );
-    println!("  {}", "-".repeat(58));
+    println!("  {}", "-".repeat(62));
 
-    for (shift, members, coupling) in [
-        (0.0, 2, 2.0),
-        (0.0, 3, 1.4),
-        (2.0, 3, 1.4),
-        (8.0, 3, 1.4),
-        (0.0, 3, 0.8),
-        (0.0, 3, 0.4),
+    let fmt = |mut h: Vec<usize>| {
+        h.sort();
+        if h.is_empty() {
+            "never".to_string()
+        } else {
+            format!("{} / {:.0}%", h[h.len() / 2], 100.0 * h.len() as f64 / seeds as f64)
+        }
+    };
+
+    for (shift, coupling) in [
+        (0.0, 1.4),
+        (8.0, 1.4),
+        (0.0, 0.8),
+        (0.0, 0.6),
+        (0.0, 0.4),
     ] {
-        let mut hits: Vec<usize> = (0..seeds)
-            .filter_map(|s| run(s, 600, shift, coupling, members).fired_at)
+        let fast: Vec<usize> = (0..seeds)
+            .filter_map(|s| run(s, 1200, shift, coupling, 3, ScaleLadder::new([1])).fired_at)
             .collect();
-        hits.sort();
+        let full: Vec<usize> = (0..seeds)
+            .filter_map(|s| run(s, 1200, shift, coupling, 3, ScaleLadder::default()).fired_at)
+            .collect();
         println!(
-            "  {:>9.1}s  {:>8}  {:>10.1}  {:>14}  {:>7.0}%",
+            "  {:>9.1}s  {:>10.1}  {:>18}  {:>18}",
             shift,
-            members,
             coupling,
-            hits.get(hits.len() / 2)
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "never".into()),
-            100.0 * hits.len() as f64 / seeds as f64
+            fmt(fast),
+            fmt(full)
         );
     }
 
@@ -212,9 +231,12 @@ fn main() {
         println!("  profile mismatch. Validity does not degrade with mismatch because each");
         println!("  session is standardised against its own history and no session takes part");
         println!("  in another's baseline — see population::PopulationTracker.");
-        println!("\n  Rows reading 'never' are the honest exposure statement, not a defect:");
-        println!("  coupling below the provisioned floor is out of reach by design. State it");
-        println!("  in advance with planning::weakest_detectable_signal.");
+        println!("\n  The ladder mixes several block lengths concurrently, so no single time");
+        println!("  scale has to be guessed. It roughly halves the weakest detectable coupling");
+        println!("  while costing only ln(#scales) nats on signals the fast scale already sees.");
+        println!("\n  Rows still reading 'never' are the honest exposure statement, not a");
+        println!("  defect: coupling below the provisioned floor is out of reach by design.");
+        println!("  State it in advance with planning::weakest_detectable_signal.");
     } else {
         println!("VERDICT: CALIBRATION FAILURE — do not deploy this configuration.");
         for f in &failures {
