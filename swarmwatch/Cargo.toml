@@ -1,0 +1,30 @@
+[package]
+name = "swarmwatch"
+version = "0.1.0"
+edition = "2021"
+description = "Blue-team detection and consent control for multi-agent swarms: controllability-tiered observation, deterministic replication gating, and anytime-valid population-relative swarm detection."
+license = "Apache-2.0"
+
+# Intentionally zero dependencies.
+#
+# This crate is monitoring infrastructure. Every dependency is a write path into
+# the thing that is supposed to be outside the adversary's reach, and a build-time
+# network fetch is a Tier 2 surface in the supply chain. SHA-256, HMAC, the PRNG,
+# and the statistics are implemented in-crate and are individually testable
+# against published vectors.
+[dependencies]
+
+[lib]
+name = "swarmwatch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "swarmwatch-demo"
+path = "src/bin/demo.rs"
+
+[profile.release]
+opt-level = 3
+
+[[bin]]
+name = "swarmwatch-probe"
+path = "src/bin/probe.rs"
